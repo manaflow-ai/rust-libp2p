@@ -90,8 +90,13 @@ impl<T: AuthenticatedMultiplexedTransport>
         self,
         cfg: libp2p_dns::ResolverConfig,
         opts: libp2p_dns::ResolverOpts,
-    ) -> SwarmBuilder<super::provider::Tokio, WebsocketPhase<impl AuthenticatedMultiplexedTransport>>
-    {
+    ) -> Result<
+        SwarmBuilder<
+            super::provider::Tokio,
+            WebsocketPhase<impl AuthenticatedMultiplexedTransport>,
+        >,
+        std::io::Error,
+    > {
         self.without_any_other_transports()
             .with_dns_config(cfg, opts)
     }

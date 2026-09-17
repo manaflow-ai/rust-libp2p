@@ -59,7 +59,7 @@
 pub mod tokio {
     use std::sync::Arc;
 
-    use hickory_resolver::{name_server::TokioConnectionProvider, system_conf, TokioResolver};
+    use hickory_resolver::{net::runtime::TokioRuntimeProvider, system_conf, TokioResolver};
     use parking_lot::Mutex;
 
     /// A `Transport` wrapper for performing DNS lookups when dialing `Multiaddr`esses
@@ -69,8 +69,8 @@ pub mod tokio {
     impl<T> Transport<T> {
         /// Creates a new [`Transport`] from the OS's DNS configuration and defaults.
         pub fn system(inner: T) -> Result<Transport<T>, std::io::Error> {
-            let (cfg, opts) = system_conf::read_system_conf()?;
-            Ok(Self::custom(inner, cfg, opts))
+            let (cfg, opts) = system_conf::read_system_conf().map_err(std::io::Error::other)?;
+            Self::custom(inner, cfg, opts)
         }
 
         /// Creates a [`Transport`] with a custom resolver configuration
@@ -79,16 +79,14 @@ pub mod tokio {
             inner: T,
             cfg: hickory_resolver::config::ResolverConfig,
             opts: hickory_resolver::config::ResolverOpts,
-        ) -> Transport<T> {
-            Transport {
+        ) -> Result<Transport<T>, std::io::Error> {
+            Ok(Transport {
                 inner: Arc::new(Mutex::new(inner)),
-                resolver: TokioResolver::builder_with_config(
-                    cfg,
-                    TokioConnectionProvider::default(),
-                )
-                .with_options(opts)
-                .build(),
-            }
+                resolver: TokioResolver::builder_with_config(cfg, TokioRuntimeProvider::default())
+                    .with_options(opts)
+                    .build()
+                    .map_err(std::io::Error::other)?,
+            })
         }
     }
 }
@@ -107,13 +105,9 @@ use async_trait::async_trait;
 use futures::{future::BoxFuture, prelude::*};
 pub use hickory_resolver::{
     config::{ResolverConfig, ResolverOpts},
-    ResolveError, ResolveErrorKind,
+    net::NetError as ResolveError,
 };
-use hickory_resolver::{
-    lookup::{Ipv4Lookup, Ipv6Lookup, TxtLookup},
-    lookup_ip::LookupIp,
-    name_server::ConnectionProvider,
-};
+use hickory_resolver::{lookup_ip::LookupIp, proto::rr::RData, ConnectionProvider};
 use libp2p_core::{
     multiaddr::{Multiaddr, Protocol},
     transport::{DialOpts, ListenerId, TransportError, TransportEvent},
@@ -336,7 +330,7 @@ where
                 Err(Error::Dial(dial_errors))
             } else {
                 Err(Error::ResolveError(
-                    ResolveErrorKind::Message("No Matching Records Found").into(),
+                    ResolveError::Message("No Matching Records Found"),
                 ))
             }
         }
@@ -431,9 +425,9 @@ fn resolve<'a, E: 'a + Send, R: Resolver>(
             .map(move |res| match res {
                 Ok(ips) => {
                     let mut ips = ips.into_iter();
-                    let one = ips
-                        .next()
-                        .expect("If there are no results, `Err(NoRecordsFound)` is expected.");
+                    let one = ips.next().ok_or_else(|| {
+                        Error::ResolveError(ResolveError::Message("No Matching Records Found"))
+                    })?;
                     if let Some(two) = ips.next() {
                         Ok(Resolved::Many(
                             iter::once(one)
@@ -454,20 +448,19 @@ fn resolve<'a, E: 'a + Send, R: Resolver>(
             .map(move |res| match res {
                 Ok(ips) => {
                     let mut ips = ips.into_iter();
-                    let one = ips
-                        .next()
-                        .expect("If there are no results, `Err(NoRecordsFound)` is expected.");
+                    let one = ips.next().ok_or_else(|| {
+                        Error::ResolveError(ResolveError::Message("No Matching Records Found"))
+                    })?;
                     if let Some(two) = ips.next() {
                         Ok(Resolved::Many(
                             iter::once(one)
                                 .chain(iter::once(two))
                                 .chain(ips)
-                                .map(Ipv4Addr::from)
                                 .map(Protocol::from)
                                 .collect(),
                         ))
                     } else {
-                        Ok(Resolved::One(Protocol::from(Ipv4Addr::from(one))))
+                        Ok(Resolved::One(Protocol::from(one)))
                     }
                 }
                 Err(e) => Err(Error::ResolveError(e)),
@@ -478,20 +471,19 @@ fn resolve<'a, E: 'a + Send, R: Resolver>(
             .map(move |res| match res {
                 Ok(ips) => {
                     let mut ips = ips.into_iter();
-                    let one = ips
-                        .next()
-                        .expect("If there are no results, `Err(NoRecordsFound)` is expected.");
+                    let one = ips.next().ok_or_else(|| {
+                        Error::ResolveError(ResolveError::Message("No Matching Records Found"))
+                    })?;
                     if let Some(two) = ips.next() {
                         Ok(Resolved::Many(
                             iter::once(one)
                                 .chain(iter::once(two))
                                 .chain(ips)
-                                .map(Ipv6Addr::from)
                                 .map(Protocol::from)
                                 .collect(),
                         ))
                     } else {
-                        Ok(Resolved::One(Protocol::from(Ipv6Addr::from(one))))
+                        Ok(Resolved::One(Protocol::from(one)))
                     }
                 }
                 Err(e) => Err(Error::ResolveError(e)),
@@ -505,16 +497,12 @@ fn resolve<'a, E: 'a + Send, R: Resolver>(
                     Ok(txts) => {
                         let mut addrs = Vec::new();
                         for txt in txts {
-                            if let Some(chars) = txt.txt_data().first() {
-                                match parse_dnsaddr_txt(chars) {
-                                    Err(e) => {
-                                        // Skip over seemingly invalid entries.
-                                        tracing::debug!("Invalid TXT record: {:?}", e);
-                                    }
-                                    Ok(a) => {
-                                        addrs.push(a);
-                                    }
+                            match parse_dnsaddr_txt(&txt) {
+                                Err(e) => {
+                                    // Skip over seemingly invalid entries.
+                                    tracing::debug!("Invalid TXT record: {:?}", e);
                                 }
+                                Ok(a) => addrs.push(a),
                             }
                         }
                         Ok(Resolved::Addrs(addrs))
@@ -544,9 +532,9 @@ fn invalid_data(e: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> io::E
 #[doc(hidden)]
 pub trait Resolver {
     async fn lookup_ip(&self, name: String) -> Result<LookupIp, ResolveError>;
-    async fn ipv4_lookup(&self, name: String) -> Result<Ipv4Lookup, ResolveError>;
-    async fn ipv6_lookup(&self, name: String) -> Result<Ipv6Lookup, ResolveError>;
-    async fn txt_lookup(&self, name: String) -> Result<TxtLookup, ResolveError>;
+    async fn ipv4_lookup(&self, name: String) -> Result<Vec<Ipv4Addr>, ResolveError>;
+    async fn ipv6_lookup(&self, name: String) -> Result<Vec<Ipv6Addr>, ResolveError>;
+    async fn txt_lookup(&self, name: String) -> Result<Vec<Vec<u8>>, ResolveError>;
 }
 
 #[async_trait]
@@ -558,23 +546,49 @@ where
         self.lookup_ip(name).await
     }
 
-    async fn ipv4_lookup(&self, name: String) -> Result<Ipv4Lookup, ResolveError> {
-        self.ipv4_lookup(name).await
+    async fn ipv4_lookup(&self, name: String) -> Result<Vec<Ipv4Addr>, ResolveError> {
+        Ok(self
+            .ipv4_lookup(name)
+            .await?
+            .answers()
+            .iter()
+            .filter_map(|r| match &r.data {
+                RData::A(a) => Some(a.0),
+                _ => None,
+            })
+            .collect())
     }
 
-    async fn ipv6_lookup(&self, name: String) -> Result<Ipv6Lookup, ResolveError> {
-        self.ipv6_lookup(name).await
+    async fn ipv6_lookup(&self, name: String) -> Result<Vec<Ipv6Addr>, ResolveError> {
+        Ok(self
+            .ipv6_lookup(name)
+            .await?
+            .answers()
+            .iter()
+            .filter_map(|r| match &r.data {
+                RData::AAAA(a) => Some(a.0),
+                _ => None,
+            })
+            .collect())
     }
 
-    async fn txt_lookup(&self, name: String) -> Result<TxtLookup, ResolveError> {
-        self.txt_lookup(name).await
+    async fn txt_lookup(&self, name: String) -> Result<Vec<Vec<u8>>, ResolveError> {
+        Ok(self
+            .txt_lookup(name)
+            .await?
+            .answers()
+            .iter()
+            .filter_map(|r| match &r.data {
+                RData::TXT(t) => t.txt_data.first().map(|data| data.to_vec()),
+                _ => None,
+            })
+            .collect())
     }
 }
 
 #[cfg(all(test, feature = "tokio"))]
 mod tests {
     use futures::future::BoxFuture;
-    use hickory_resolver::proto::{ProtoError, ProtoErrorKind};
     use libp2p_core::{
         multiaddr::{Multiaddr, Protocol},
         transport::{PortUse, TransportError, TransportEvent},
@@ -588,9 +602,9 @@ mod tests {
         transport: T,
         test_fn: impl FnOnce(tokio::Transport<T>) -> F,
     ) {
-        let config = ResolverConfig::quad9();
+        let config = ResolverConfig::udp_and_tcp(&hickory_resolver::config::QUAD9);
         let opts = ResolverOpts::default();
-        let transport = tokio::Transport::custom(transport, config, opts);
+        let transport = tokio::Transport::custom(transport, config, opts).unwrap();
         let rt = ::tokio::runtime::Builder::new_current_thread()
             .enable_io()
             .enable_time()
@@ -730,14 +744,7 @@ mod tests {
                     );
 
                     match &dial_errs[0] {
-                        Error::ResolveError(e) => match e.kind() {
-                            ResolveErrorKind::Proto(ProtoError { kind, .. })
-                                if matches!(
-                                    kind.as_ref(),
-                                    ProtoErrorKind::NoRecordsFound { .. }
-                                ) => {}
-                            _ => panic!("Unexpected DNS error: {e:?}"),
-                        },
+                        Error::ResolveError(e) if e.is_no_records_found() => {}
                         other => {
                             panic!("Expected a single ResolveError(...) sub-error, got {other:?}")
                         }

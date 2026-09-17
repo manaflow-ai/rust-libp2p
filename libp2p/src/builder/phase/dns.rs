@@ -34,15 +34,20 @@ impl<T: AuthenticatedMultiplexedTransport> SwarmBuilder<super::provider::Tokio, 
         self,
         cfg: libp2p_dns::ResolverConfig,
         opts: libp2p_dns::ResolverOpts,
-    ) -> SwarmBuilder<super::provider::Tokio, WebsocketPhase<impl AuthenticatedMultiplexedTransport>>
-    {
-        SwarmBuilder {
+    ) -> Result<
+        SwarmBuilder<
+            super::provider::Tokio,
+            WebsocketPhase<impl AuthenticatedMultiplexedTransport>,
+        >,
+        std::io::Error,
+    > {
+        Ok(SwarmBuilder {
             keypair: self.keypair,
             phantom: PhantomData,
             phase: WebsocketPhase {
-                transport: libp2p_dns::tokio::Transport::custom(self.phase.transport, cfg, opts),
+                transport: libp2p_dns::tokio::Transport::custom(self.phase.transport, cfg, opts)?,
             },
-        }
+        })
     }
 }
 
