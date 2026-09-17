@@ -291,6 +291,7 @@ mod tests {
                 libp2p_dns::ResolverConfig::default(),
                 libp2p_dns::ResolverOpts::default(),
             )
+            .unwrap()
             .with_behaviour(|_| libp2p_swarm::dummy::Behaviour)
             .unwrap()
             .build();
@@ -306,6 +307,7 @@ mod tests {
                 libp2p_dns::ResolverConfig::default(),
                 libp2p_dns::ResolverOpts::default(),
             )
+            .unwrap()
             .with_behaviour(|_| libp2p_swarm::dummy::Behaviour)
             .unwrap()
             .build();
@@ -334,6 +336,7 @@ mod tests {
                 libp2p_dns::ResolverConfig::default(),
                 libp2p_dns::ResolverOpts::default(),
             )
+            .unwrap()
             .with_behaviour(|_| libp2p_swarm::dummy::Behaviour)
             .unwrap()
             .build();

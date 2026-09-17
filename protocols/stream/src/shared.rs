@@ -19,7 +19,8 @@ pub(crate) struct Shared {
     /// [`mpsc::Receiver`] in [`IncomingStreams`].
     supported_inbound_protocols: HashMap<StreamProtocol, mpsc::Sender<(PeerId, Stream)>>,
 
-    connections: HashMap<ConnectionId, PeerId>,
+    /// Peer identity and whether this connection traverses a relay.
+    connections: HashMap<ConnectionId, (PeerId, bool)>,
     senders: HashMap<ConnectionId, mpsc::Sender<NewStream>>,
 
     /// Tracks channel pairs for a peer whilst we are dialing them.
@@ -99,12 +100,18 @@ impl Shared {
         }
     }
 
-    pub(crate) fn on_connection_established(&mut self, conn: ConnectionId, peer: PeerId) {
-        self.connections.insert(conn, peer);
+    pub(crate) fn on_connection_established(
+        &mut self,
+        conn: ConnectionId,
+        peer: PeerId,
+        relayed: bool,
+    ) {
+        self.connections.insert(conn, (peer, relayed));
     }
 
     pub(crate) fn on_connection_closed(&mut self, conn: ConnectionId) {
         self.connections.remove(&conn);
+        self.senders.remove(&conn);
     }
 
     pub(crate) fn on_dial_failure(&mut self, peer: PeerId, reason: String) {
@@ -123,12 +130,18 @@ impl Shared {
     }
 
     pub(crate) fn sender(&mut self, peer: PeerId) -> mpsc::Sender<NewStream> {
-        let maybe_sender = self
-            .connections
-            .iter()
-            .filter_map(|(c, p)| (p == &peer).then_some(c))
-            .choose(&mut rand::thread_rng())
-            .and_then(|c| self.senders.get(c));
+        // Keep established relayed streams alive, but prefer a successfully
+        // hole-punched connection for newly opened streams. Closed handlers
+        // must not hide a healthy fallback during connection teardown.
+        let choose = |relayed| {
+            self.connections
+                .iter()
+                .filter(|(_, (p, r))| *p == peer && *r == relayed)
+                .filter_map(|(id, _)| self.senders.get(id))
+                .filter(|sender| !sender.is_closed())
+                .choose(&mut rand::thread_rng())
+        };
+        let maybe_sender = choose(false).or_else(|| choose(true));
 
         match maybe_sender {
             Some(sender) => {
@@ -169,5 +182,51 @@ impl Shared {
         self.senders.insert(connection, sender);
 
         receiver
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn closed_connections_release_sender_state() {
+        let (dial, _) = mpsc::channel(0);
+        let mut shared = Shared::new(dial);
+        let peer = PeerId::random();
+        for index in 0..100 {
+            let id = ConnectionId::new_unchecked(index);
+            let receiver = shared.receiver(peer, id);
+            shared.on_connection_established(id, peer, false);
+            shared.on_connection_closed(id);
+            drop(receiver);
+        }
+        assert!(shared.connections.is_empty());
+        assert!(shared.senders.is_empty());
+    }
+
+    #[test]
+    fn new_streams_prefer_direct_connections_and_fall_back_after_disconnect() {
+        let (dial, _) = mpsc::channel(0);
+        let mut shared = Shared::new(dial);
+        let peer = PeerId::random();
+        let relay = ConnectionId::new_unchecked(1);
+        let direct = ConnectionId::new_unchecked(2);
+        let mut relayed = shared.receiver(peer, relay);
+        let mut direct_rx = shared.receiver(peer, direct);
+        shared.on_connection_established(relay, peer, true);
+        shared.on_connection_established(direct, peer, false);
+        let request = || NewStream {
+            protocol: StreamProtocol::new("/test"),
+            sender: futures::channel::oneshot::channel().0,
+        };
+        for _ in 0..100 {
+            shared.sender(peer).try_send(request()).unwrap();
+            assert!(direct_rx.try_next().unwrap().is_some());
+            assert!(relayed.try_next().is_err());
+        }
+        shared.on_connection_closed(direct);
+        shared.sender(peer).try_send(request()).unwrap();
+        assert!(relayed.try_next().unwrap().is_some());
     }
 }

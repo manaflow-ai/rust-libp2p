@@ -39,6 +39,91 @@ use libp2p_swarm::{dial_opts::DialOpts, Config, DialError, NetworkBehaviour, Swa
 use libp2p_swarm_test::SwarmExt;
 use tracing_subscriber::EnvFilter;
 
+struct TestAccess {
+    reserve: std::sync::atomic::AtomicBool,
+    circuit: std::sync::atomic::AtomicBool,
+    observed: std::sync::Mutex<Vec<(PeerId, PeerId)>>,
+}
+
+impl relay::AccessControl for TestAccess {
+    fn allow_reservation(&self, _: PeerId) -> bool {
+        self.reserve.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    fn allow_circuit(&self, source: PeerId, destination: PeerId) -> bool {
+        self.observed.lock().unwrap().push((source, destination));
+        self.circuit.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[tokio::test]
+async fn access_control_denies_reservation_before_allocation() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let access = std::sync::Arc::new(TestAccess {
+            reserve: false.into(), circuit: false.into(), observed: Default::default(),
+        });
+        let mut relay = build_relay_with_config(relay::Config {
+            access_control: Some(access), ..Default::default()
+        });
+        let relay_id = *relay.local_peer_id();
+        let address = Multiaddr::empty().with(Protocol::Memory(rand::random::<u64>()));
+        relay.listen_on(address.clone()).unwrap();
+        relay.add_external_address(address.clone());
+        let mut client = build_client();
+        client.listen_on(address.with(Protocol::P2p(relay_id)).with(Protocol::P2pCircuit)).unwrap();
+        loop {
+            tokio::select! {
+                _ = client.select_next_some() => {},
+                event = relay.select_next_some() => if let SwarmEvent::Behaviour(RelayEvent::Relay(relay::Event::ReservationReqDenied { status, .. })) = event {
+                    assert!(matches!(status, relay::StatusCode::PermissionDenied));
+                    assert_eq!(relay.behaviour().relay.num_reservations(), 0);
+                    break;
+                }
+            }
+        }
+    }).await.unwrap();
+}
+
+#[tokio::test]
+async fn access_control_sees_both_peers_and_denies_before_forwarding() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let access = std::sync::Arc::new(TestAccess {
+            reserve: true.into(), circuit: false.into(), observed: Default::default(),
+        });
+        let mut relay = build_relay_with_config(relay::Config {
+            access_control: Some(access.clone()), ..Default::default()
+        });
+        let relay_id = *relay.local_peer_id();
+        let address = Multiaddr::empty().with(Protocol::Memory(rand::random::<u64>()));
+        relay.listen_on(address.clone()).unwrap();
+        relay.add_external_address(address.clone());
+        let mut destination = build_client();
+        let dst_id = *destination.local_peer_id();
+        let address = address.with(Protocol::P2p(relay_id)).with(Protocol::P2pCircuit);
+        destination.listen_on(address.clone()).unwrap();
+        loop {
+            tokio::select! {
+                _ = destination.select_next_some() => {},
+                event = relay.select_next_some() => if matches!(event, SwarmEvent::Behaviour(RelayEvent::Relay(relay::Event::ReservationReqAccepted { .. }))) { break; }
+            }
+        }
+        let mut source = build_client();
+        let src_id = *source.local_peer_id();
+        source.dial(address.with(Protocol::P2p(dst_id))).unwrap();
+        loop {
+            tokio::select! {
+                _ = source.select_next_some() => {},
+                event = destination.select_next_some() => assert!(!matches!(event, SwarmEvent::Behaviour(ClientEvent::Relay(relay::client::Event::InboundCircuitEstablished { .. })))),
+                event = relay.select_next_some() => if let SwarmEvent::Behaviour(RelayEvent::Relay(relay::Event::CircuitReqDenied { status, .. })) = event {
+                    assert!(matches!(status, relay::StatusCode::PermissionDenied));
+                    assert_eq!(relay.behaviour().relay.num_circuits(), 0);
+                    assert_eq!(*access.observed.lock().unwrap(), vec![(src_id, dst_id)]);
+                    break;
+                }
+            }
+        }
+    }).await.unwrap();
+}
+
 #[tokio::test]
 async fn reservation() {
     let _ = tracing_subscriber::fmt()
