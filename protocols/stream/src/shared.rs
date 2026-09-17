@@ -33,52 +33,6 @@ pub(crate) struct Shared {
     dial_sender: mpsc::Sender<PeerId>,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn closed_connections_release_sender_state() {
-        let (dial, _) = mpsc::channel(0);
-        let mut shared = Shared::new(dial);
-        let peer = PeerId::random();
-        for index in 0..100 {
-            let id = ConnectionId::new_unchecked(index);
-            let receiver = shared.receiver(peer, id);
-            shared.on_connection_established(id, peer, false);
-            shared.on_connection_closed(id);
-            drop(receiver);
-        }
-        assert!(shared.connections.is_empty());
-        assert!(shared.senders.is_empty());
-    }
-
-    #[test]
-    fn new_streams_prefer_direct_connections_and_fall_back_after_disconnect() {
-        let (dial, _) = mpsc::channel(0);
-        let mut shared = Shared::new(dial);
-        let peer = PeerId::random();
-        let relay = ConnectionId::new_unchecked(1);
-        let direct = ConnectionId::new_unchecked(2);
-        let mut relayed = shared.receiver(peer, relay);
-        let mut direct_rx = shared.receiver(peer, direct);
-        shared.on_connection_established(relay, peer, true);
-        shared.on_connection_established(direct, peer, false);
-        let request = || NewStream {
-            protocol: StreamProtocol::new("/test"),
-            sender: futures::channel::oneshot::channel().0,
-        };
-        for _ in 0..100 {
-            shared.sender(peer).try_send(request()).unwrap();
-            assert!(direct_rx.try_next().unwrap().is_some());
-            assert!(relayed.try_next().is_err());
-        }
-        shared.on_connection_closed(direct);
-        shared.sender(peer).try_send(request()).unwrap();
-        assert!(relayed.try_next().unwrap().is_some());
-    }
-}
-
 impl Shared {
     pub(crate) fn lock(shared: &Arc<Mutex<Shared>>) -> MutexGuard<'_, Shared> {
         shared.lock().unwrap_or_else(|e| e.into_inner())
@@ -228,5 +182,51 @@ impl Shared {
         self.senders.insert(connection, sender);
 
         receiver
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn closed_connections_release_sender_state() {
+        let (dial, _) = mpsc::channel(0);
+        let mut shared = Shared::new(dial);
+        let peer = PeerId::random();
+        for index in 0..100 {
+            let id = ConnectionId::new_unchecked(index);
+            let receiver = shared.receiver(peer, id);
+            shared.on_connection_established(id, peer, false);
+            shared.on_connection_closed(id);
+            drop(receiver);
+        }
+        assert!(shared.connections.is_empty());
+        assert!(shared.senders.is_empty());
+    }
+
+    #[test]
+    fn new_streams_prefer_direct_connections_and_fall_back_after_disconnect() {
+        let (dial, _) = mpsc::channel(0);
+        let mut shared = Shared::new(dial);
+        let peer = PeerId::random();
+        let relay = ConnectionId::new_unchecked(1);
+        let direct = ConnectionId::new_unchecked(2);
+        let mut relayed = shared.receiver(peer, relay);
+        let mut direct_rx = shared.receiver(peer, direct);
+        shared.on_connection_established(relay, peer, true);
+        shared.on_connection_established(direct, peer, false);
+        let request = || NewStream {
+            protocol: StreamProtocol::new("/test"),
+            sender: futures::channel::oneshot::channel().0,
+        };
+        for _ in 0..100 {
+            shared.sender(peer).try_send(request()).unwrap();
+            assert!(direct_rx.try_next().unwrap().is_some());
+            assert!(relayed.try_next().is_err());
+        }
+        shared.on_connection_closed(direct);
+        shared.sender(peer).try_send(request()).unwrap();
+        assert!(relayed.try_next().unwrap().is_some());
     }
 }
