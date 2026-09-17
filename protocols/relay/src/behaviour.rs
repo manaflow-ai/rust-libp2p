@@ -26,6 +26,7 @@ use std::{
     collections::{hash_map, HashMap, HashSet, VecDeque},
     num::NonZeroU32,
     ops::Add,
+    sync::Arc,
     task::{Context, Poll},
     time::Duration,
 };
@@ -47,12 +48,25 @@ use crate::{
     protocol::{inbound_hop, outbound_stop},
 };
 
+/// Synchronous admission decisions over transport-authenticated peer identities.
+/// Implementations must not block or perform network I/O. They may consult
+/// previously authenticated, cached permissions and an application drain flag.
+pub trait AccessControl: Send + Sync {
+    /// Called for every reservation, including renewals, before allocating resources.
+    fn allow_reservation(&self, source: PeerId) -> bool;
+    /// Called before contacting the destination or forwarding circuit bytes.
+    fn allow_circuit(&self, source: PeerId, destination: PeerId) -> bool;
+}
+
 /// Configuration for the relay [`Behaviour`].
 ///
 /// # Panics
 ///
 /// [`Config::max_circuit_duration`] may not exceed [`u32::MAX`].
 pub struct Config {
+    /// `None` preserves the upstream public-relay behavior. Private relays must
+    /// install an implementation that denies peers without a valid permission.
+    pub access_control: Option<Arc<dyn AccessControl>>,
     pub max_reservations: usize,
     pub max_reservations_per_peer: usize,
     pub reservation_duration: Duration,
@@ -102,6 +116,7 @@ impl Config {
 impl std::fmt::Debug for Config {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Config")
+            .field("access_control", &self.access_control.is_some())
             .field("max_reservations", &self.max_reservations)
             .field("max_reservations_per_peer", &self.max_reservations_per_peer)
             .field("reservation_duration", &self.reservation_duration)
@@ -152,6 +167,7 @@ impl Default for Config {
         ];
 
         Config {
+            access_control: None,
             max_reservations: 128,
             max_reservations_per_peer: 4,
             reservation_duration: Duration::from_secs(60 * 60),
@@ -263,6 +279,16 @@ pub struct Behaviour {
 }
 
 impl Behaviour {
+    /// Live reservations, including separate connections from the same peer.
+    pub fn num_reservations(&self) -> usize {
+        self.reservations.values().map(HashSet::len).sum()
+    }
+
+    /// Circuits owned by the relay, including outbound negotiations in progress.
+    pub fn num_circuits(&self) -> usize {
+        self.circuits.len()
+    }
+
     pub fn new(local_peer_id: PeerId, config: Config) -> Self {
         Self {
             config,
@@ -393,6 +419,23 @@ impl NetworkBehaviour for Behaviour {
                 renewed,
             } => {
                 let now = Instant::now();
+
+                if self
+                    .config
+                    .access_control
+                    .as_ref()
+                    .is_some_and(|access| !access.allow_reservation(event_source))
+                {
+                    self.queued_actions.push_back(ToSwarm::NotifyHandler {
+                        handler: NotifyHandler::One(connection),
+                        peer_id: event_source,
+                        event: Either::Left(handler::In::DenyReservationReq {
+                            inbound_reservation_req,
+                            status: proto::Status::PERMISSION_DENIED,
+                        }),
+                    });
+                    return;
+                }
 
                 assert!(
                     !endpoint.is_relayed(),
@@ -529,6 +572,21 @@ impl NetworkBehaviour for Behaviour {
                 endpoint,
             } => {
                 let now = Instant::now();
+
+                if self.config.access_control.as_ref().is_some_and(|access| {
+                    !access.allow_circuit(event_source, inbound_circuit_req.dst())
+                }) {
+                    self.queued_actions.push_back(ToSwarm::NotifyHandler {
+                        handler: NotifyHandler::One(connection),
+                        peer_id: event_source,
+                        event: Either::Left(handler::In::DenyCircuitReq {
+                            circuit_id: None,
+                            inbound_circuit_req,
+                            status: proto::Status::PERMISSION_DENIED,
+                        }),
+                    });
+                    return;
+                }
 
                 assert!(
                     !endpoint.is_relayed(),
