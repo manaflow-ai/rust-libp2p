@@ -96,8 +96,13 @@ impl NetworkBehaviour for Behaviour {
             FromSwarm::ConnectionEstablished(ConnectionEstablished {
                 peer_id,
                 connection_id,
+                endpoint,
                 ..
-            }) => Shared::lock(&self.shared).on_connection_established(connection_id, peer_id),
+            }) => Shared::lock(&self.shared).on_connection_established(
+                connection_id,
+                peer_id,
+                endpoint.is_relayed(),
+            ),
             FromSwarm::ConnectionClosed(ConnectionClosed { connection_id, .. }) => {
                 Shared::lock(&self.shared).on_connection_closed(connection_id)
             }
